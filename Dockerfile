@@ -8,6 +8,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY rag_store ./rag_store
 
 ENV HF_HOME=/opt/hf-cache
+ENV HF_HUB_OFFLINE=1
+ENV TRANSFORMERS_OFFLINE=1
 RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')"
 
 ENV HOST=0.0.0.0

@@ -10,3 +10,4 @@ __pycache__/
 docs/
 examples/
 msmarco-index.tar.gz
+msmarco-index-100k.tar.gz
