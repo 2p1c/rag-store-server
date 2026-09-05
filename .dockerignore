@@ -1,0 +1,13 @@
+.git
+.github
+.venv
+venv
+.indexes
+.env
+examples
+tests
+docs
+__pycache__
+*.pyc
+.DS_Store
+*.md

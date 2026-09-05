@@ -6,7 +6,23 @@
 
 **Agent 仓库负责：** `POST` 一段 query，把结果当成 `rag_search` 工具输出。它不调 embedding，也不跑 FAISS。
 
-当前只有指导文档，还没有服务代码。实现时按 `docs/CONTRACT.md` 对齐 HTTP；背景和取舍见 `docs/design.md`。
+实现时按 `docs/CONTRACT.md` 对齐 HTTP；背景和取舍见 `docs/design.md`。
+
+## 本地运行
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+
+python -m rag_store.ingest    # 5 万条 MSMARCO passage → 本地 FAISS
+python -m rag_store.server    # POST http://127.0.0.1:8080/search
+python -m unittest discover -s tests -t .
+```
+
+入库模型是 `sentence-transformers/all-MiniLM-L6-v2`。索引写在 `.indexes/msmarco-minilm/`，启动时会打印向量条数和磁盘大小。HTTP 只收 `query`；含汉字时先用 DeepSeek 译成英文，再 FAISS 取 20 条，按方案 B 过滤装盒。
+
+复制 `.env.example` 为 `.env`，填入 `DEEPSEEK_API_KEY`。翻译提示词在 `rag_store/config.py` 的 `TRANSLATE_PROMPT`。
 
 ## 文档
 

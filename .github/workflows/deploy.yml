@@ -1,0 +1,50 @@
+name: Build and Deploy RAG
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ghcr.io/2p1c/rag-store-server:latest
+            ghcr.io/2p1c/rag-store-server:v${{ github.run_number }}
+
+      - name: Deploy to server
+        env:
+          SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          SSH_HOST: ${{ secrets.DEPLOY_HOST }}
+          SSH_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+        run: |
+          install -m 600 /dev/null ~/chat_yutongzhu_com
+          echo "$SSH_KEY" > ~/chat_yutongzhu_com
+          ssh -i ~/chat_yutongzhu_com -o StrictHostKeyChecking=accept-new "$SSH_USER@$SSH_HOST" "
+            set -e
+            cd '$DEPLOY_PATH'
+            docker compose pull rag
+            docker compose up -d --no-deps rag
+            docker image prune -f
+          "
+          rm -f ~/chat_yutongzhu_com
