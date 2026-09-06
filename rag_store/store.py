@@ -4,11 +4,17 @@ import json
 from collections.abc import Callable
 from pathlib import Path
 
-import faiss
 import numpy as np
 
 from rag_store.config import CANDIDATES, ENCODE_BATCH_SIZE, MAX_CHARS, MIN_SCORE, MODEL_ID
+from rag_store.document_store import (
+    OFFSETS_FILE,
+    DocumentStore,
+    write_docs_jsonl,
+    write_offsets,
+)
 from rag_store.translate import translate_query
+from rag_store.vector_index import VectorIndex
 
 EncodeFn = Callable[[list[str]], np.ndarray]
 
@@ -64,21 +70,17 @@ def make_encoder(model_id: str = MODEL_ID) -> EncodeFn:
 class VectorStore:
     def __init__(
         self,
-        index: faiss.Index,
-        texts: list[str],
-        sources: list[str],
+        index: VectorIndex,
+        doc_store: DocumentStore,
         encode_fn: EncodeFn,
         index_dir: Path | None = None,
         model_id: str = MODEL_ID,
         translate_fn: Callable[[str], str] | None = None,
     ) -> None:
-        if len(texts) != len(sources):
-            raise ValueError("texts and sources length mismatch")
-        if index.ntotal != len(texts):
+        if index.ntotal != len(doc_store):
             raise ValueError("index size does not match documents")
         self.index = index
-        self.texts = texts
-        self.sources = sources
+        self.doc_store = doc_store
         self.encode_fn = encode_fn
         self.index_dir = index_dir
         self.model_id = model_id
@@ -96,28 +98,36 @@ class VectorStore:
         if encode_fn is None:
             encode_fn = make_encoder(model_id)
         vecs = np.ascontiguousarray(encode_fn(texts), dtype=np.float32)
-        index = faiss.IndexFlatIP(vecs.shape[1])
+        index = VectorIndex.flat_ip(vecs.shape[1])
         index.add(vecs)
         return cls(
             index,
-            texts,
-            sources,
+            DocumentStore.from_lists(texts, sources),
             encode_fn,
             model_id=model_id,
             translate_fn=translate_fn,
         )
 
     def save(self, index_dir: str | Path) -> Path:
+        if self.doc_store.is_file_backed():
+            raise ValueError("save() requires an in-memory document store")
         path = Path(index_dir)
         path.mkdir(parents=True, exist_ok=True)
-        faiss.write_index(self.index, str(path / INDEX_FILE))
-        with (path / DOCS_FILE).open("w", encoding="utf-8") as f:
-            for text, source in zip(self.texts, self.sources):
-                f.write(json.dumps({"text": text, "source": source}, ensure_ascii=False) + "\n")
+        self.index.write(path / INDEX_FILE)
+        docs = [self.doc_store.get(i) for i in range(len(self.doc_store))]
+        offsets = write_docs_jsonl(
+            path / DOCS_FILE,
+            [d["text"] for d in docs],
+            [d["source"] for d in docs],
+        )
+        write_offsets(path / OFFSETS_FILE, offsets)
         info = {
             "model_id": self.model_id,
             "ntotal": int(self.index.ntotal),
             "dim": int(self.index.d),
+            "format": "v2",
+            "docs_file": DOCS_FILE,
+            "offsets_file": OFFSETS_FILE,
         }
         (path / INFO_FILE).write_text(json.dumps(info, indent=2) + "\n", encoding="utf-8")
         self.index_dir = path
@@ -138,17 +148,29 @@ class VectorStore:
         stored_model = info.get("model_id")
         if stored_model != model_id:
             raise ValueError(f"index built with {stored_model}, current model is {model_id}")
-        texts: list[str] = []
-        sources: list[str] = []
-        with (path / DOCS_FILE).open(encoding="utf-8") as f:
-            for line in f:
-                row = json.loads(line)
-                texts.append(row["text"])
-                sources.append(row["source"])
-        index = faiss.read_index(str(path / INDEX_FILE))
+        fmt = info.get("format", "v1")
+        if fmt == "v2":
+            docs_file = info.get("docs_file", DOCS_FILE)
+            offsets_file = info.get("offsets_file", OFFSETS_FILE)
+            offsets_path = path / offsets_file
+            if not offsets_path.exists():
+                raise FileNotFoundError(
+                    f"missing {offsets_path}; run python -m rag_store.migrate_offsets {path}"
+                )
+            doc_store = DocumentStore.from_files(path / docs_file, offsets_path)
+        else:
+            texts: list[str] = []
+            sources: list[str] = []
+            with (path / DOCS_FILE).open(encoding="utf-8") as f:
+                for line in f:
+                    row = json.loads(line)
+                    texts.append(row["text"])
+                    sources.append(row["source"])
+            doc_store = DocumentStore.from_lists(texts, sources)
+        index = VectorIndex.read(path / INDEX_FILE)
         if encode_fn is None:
             encode_fn = make_encoder(model_id)
-        return cls(index, texts, sources, encode_fn, index_dir=path, model_id=model_id)
+        return cls(index, doc_store, encode_fn, index_dir=path, model_id=model_id)
 
     def encode(self, texts: list[str]) -> np.ndarray:
         return np.ascontiguousarray(self.encode_fn(texts), dtype=np.float32)
@@ -159,13 +181,10 @@ class VectorStore:
 
     def top_k(self, query: str, k: int = CANDIDATES) -> list[tuple[str, str, float]]:
         vec = self.encode([query])
-        k = min(k, self.index.ntotal)
-        scores, ids = self.index.search(vec, k)
         hits: list[tuple[str, str, float]] = []
-        for score, idx in zip(scores[0], ids[0]):
-            if idx < 0:
-                continue
-            hits.append((self.texts[idx], self.sources[idx], float(score)))
+        for idx, score in self.index.search(vec, k):
+            doc = self.doc_store.get(idx)
+            hits.append((doc["text"], doc["source"], score))
         return hits
 
     def size_info(self) -> dict:

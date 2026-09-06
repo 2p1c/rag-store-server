@@ -1,10 +1,13 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
 
 import numpy as np
 
-from rag_store.store import VectorStore, format_bytes, pack_results
+from rag_store.document_store import DocumentStore, build_offsets, write_docs_jsonl, write_offsets
+from rag_store.migrate_offsets import migrate
+from rag_store.store import INFO_FILE, VectorStore, format_bytes, pack_results
 
 
 class PackResultsTest(unittest.TestCase):
@@ -104,6 +107,90 @@ class VectorStoreTest(unittest.TestCase):
             loaded = VectorStore.load(path, encode_fn=encode_fn, model_id="dummy")
             self.assertEqual(loaded.size_info()["ntotal"], 2)
             self.assertEqual(loaded.search("apple")[0]["text"], "apple")
+            info = json.loads((path / INFO_FILE).read_text(encoding="utf-8"))
+            self.assertEqual(info["format"], "v2")
+            self.assertTrue(loaded.doc_store.is_file_backed())
+
+
+class DocumentStoreTest(unittest.TestCase):
+    def test_document_store_get_roundtrip(self):
+        texts = ["apple", "车", "third"]
+        sources = ["a", "b", "c"]
+        with tempfile.TemporaryDirectory() as tmp:
+            docs_path = Path(tmp) / "docs.jsonl"
+            offsets_path = Path(tmp) / "docs.offsets"
+            offsets = write_docs_jsonl(docs_path, texts, sources)
+            write_offsets(offsets_path, offsets)
+            store = DocumentStore.from_files(docs_path, offsets_path)
+            self.assertEqual(len(store), 3)
+            self.assertEqual(store.get(0), {"text": "apple", "source": "a"})
+            self.assertEqual(store.get(1), {"text": "车", "source": "b"})
+            self.assertEqual(store.get(2), {"text": "third", "source": "c"})
+            rebuilt = build_offsets(docs_path)
+            np.testing.assert_array_equal(rebuilt, offsets)
+
+
+class V1V2LoadTest(unittest.TestCase):
+    def _store_and_encode(self):
+        texts = ["apple", "car"]
+        vectors = np.array([[1.0, 0.0], [0.0, 1.0]], dtype=np.float32)
+        table = {t: v for t, v in zip(texts, vectors)}
+
+        def encode_fn(batch: list[str]) -> np.ndarray:
+            return np.stack([table[t] for t in batch]).astype(np.float32)
+
+        store = VectorStore.build(
+            texts, ["doc:0", "doc:1"], encode_fn=encode_fn, model_id="dummy"
+        )
+        return store, encode_fn
+
+    def _write_v1_dir(self, path: Path, store: VectorStore) -> None:
+        store.save(path)
+        (path / "docs.offsets").unlink()
+        info = json.loads((path / INFO_FILE).read_text(encoding="utf-8"))
+        info.pop("format", None)
+        info.pop("docs_file", None)
+        info.pop("offsets_file", None)
+        (path / INFO_FILE).write_text(json.dumps(info, indent=2) + "\n", encoding="utf-8")
+
+    def test_v2_load_does_not_fill_texts_list(self):
+        store, encode_fn = self._store_and_encode()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp)
+            store.save(path)
+            loaded = VectorStore.load(path, encode_fn=encode_fn, model_id="dummy")
+            self.assertTrue(loaded.doc_store.is_file_backed())
+            self.assertFalse(hasattr(loaded, "texts"))
+            self.assertFalse(hasattr(loaded, "sources"))
+            self.assertEqual(loaded.search("apple")[0]["text"], "apple")
+
+    def test_migrate_offsets_matches_ntotal(self):
+        store, encode_fn = self._store_and_encode()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp)
+            self._write_v1_dir(path, store)
+            migrate(path)
+            info = json.loads((path / INFO_FILE).read_text(encoding="utf-8"))
+            self.assertEqual(info["format"], "v2")
+            offsets = np.fromfile(path / info["offsets_file"], dtype=np.uint64)
+            self.assertEqual(len(offsets), info["ntotal"])
+            loaded = VectorStore.load(path, encode_fn=encode_fn, model_id="dummy")
+            self.assertTrue(loaded.doc_store.is_file_backed())
+            self.assertEqual(loaded.search("apple")[0]["text"], "apple")
+
+    def test_v1_and_v2_search_match(self):
+        store, encode_fn = self._store_and_encode()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            v2 = root / "v2"
+            v1 = root / "v1"
+            store.save(v2)
+            self._write_v1_dir(v1, store)
+            loaded_v2 = VectorStore.load(v2, encode_fn=encode_fn, model_id="dummy")
+            loaded_v1 = VectorStore.load(v1, encode_fn=encode_fn, model_id="dummy")
+            self.assertFalse(loaded_v1.doc_store.is_file_backed())
+            self.assertEqual(loaded_v1.search("apple"), loaded_v2.search("apple"))
+            self.assertEqual(loaded_v1.search("car"), loaded_v2.search("car"))
 
 
 if __name__ == "__main__":

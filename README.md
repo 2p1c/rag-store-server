@@ -22,6 +22,12 @@ python -m unittest discover -s tests -t .
 
 入库模型是 `sentence-transformers/all-MiniLM-L6-v2`。索引写在 `.indexes/msmarco-minilm/`，启动时会打印向量条数和磁盘大小。HTTP 只收 `query`；含汉字时先用 DeepSeek 译成英文，再 FAISS 取 20 条，按方案 B 过滤装盒。
 
+新入库会写成 v2：向量在 `index.faiss`，正文留在 `docs.jsonl`，用 `docs.offsets` 按 id 按需读取。已有 v1 索引不必重新 embedding，升级一次即可：
+
+```bash
+python -m rag_store.migrate_offsets .indexes/msmarco-minilm
+```
+
 复制 `.env.example` 为 `.env`，填入 `DEEPSEEK_API_KEY`。翻译提示词在 `rag_store/config.py` 的 `TRANSLATE_PROMPT`。
 
 ## 文档
